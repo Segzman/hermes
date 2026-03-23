@@ -1,0 +1,28 @@
+# Browser automation (auth + scraping)
+playwright>=1.44.0
+
+# D2L API / HTTP
+httpx>=0.27.0
+boto3>=1.34.0
+
+# Telegram bot
+python-telegram-bot>=21.0
+
+# Apple Reminders via iCloud CalDAV
+caldav>=1.3.9
+
+# Scheduling + reminder persistence
+apscheduler>=3.10.0
+SQLAlchemy>=2.0.0
+
+# OpenRouter / LLM agent
+openai>=1.30.0         # OpenRouter is OpenAI-compatible
+
+# Web search (free, no API key)
+ddgs>=0.1.0
+
+# Config / utils
+python-dotenv>=1.0.0
+pyyaml>=6.0
+rich>=13.0.0
+click>=8.1.0

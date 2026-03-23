@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes Slate Assignment Checker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__HERMES_DIR__
+Environment="PATH=__VENV_DIR__/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=__HERMES_DIR__/.env
+ExecStart=__VENV_DIR__/bin/python deploy/run_with_aws_env.py slate.checker --watch
+Restart=on-failure
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=slate-checker
+
+[Install]
+WantedBy=multi-user.target
