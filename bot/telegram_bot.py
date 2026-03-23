@@ -1,7 +1,27 @@
 """
-Hermes Telegram bot — interactive agent + proactive Slate checker + reminders.
+Hermes Telegram bot -- interactive agent + proactive Slate checker + reminders.
 
 Run:  python -m bot.telegram_bot
+
+Architecture notes:
+  - This is the main entry point for the Hermes bot. It sets up the
+    Telegram bot application with python-telegram-bot (PTB), registers
+    command and message handlers, and starts the polling loop.
+  - Message flow:
+    1. Telegram sends an Update to the bot
+    2. The auth guard (_allowed) checks the chat ID against the allowed list
+    3. For commands: the appropriate cmd_* handler runs directly
+    4. For messages: handle_message() processes the input, then either:
+       a. Short-circuits to job status if the user is asking about progress
+       b. Routes to a background sub-agent for browser/terminal tasks
+       c. Runs the full LLM agent loop for everything else
+  - The proactive Slate checker runs on a configurable interval (default 60 min)
+    and notifies the user about new assignments without being asked.
+  - Reminders are initialised during post_init (after the event loop is running)
+    and use the _send helper to deliver messages.
+  - Message delivery uses a markdown-first approach with plain-text fallback,
+    because Telegram's markdown parser is strict and rejects some LLM output.
+  - Long messages are chunked into 4000-char pieces (Telegram's limit is 4096).
 """
 
 import logging
@@ -22,7 +42,9 @@ from slate.checker import cmd_run_check as run_check
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+# Only allow messages from this chat ID (single-user bot). Empty = allow all.
 ALLOWED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# How often (in minutes) to run the proactive Slate check
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MINUTES", "60"))
 
 logging.basicConfig(
@@ -36,21 +58,43 @@ log = logging.getLogger("hermes-bot")
 # ── auth guard ────────────────────────────────────────────────────────────────
 
 def _allowed(update: Update) -> bool:
+    """
+    Check if the incoming message is from the allowed Telegram chat.
+
+    If ALLOWED_CHAT_ID is not set, all chats are allowed (useful for
+    development). In production, this restricts the bot to a single user.
+    """
     cid = str(update.effective_chat.id)
     return not ALLOWED_CHAT_ID or cid == ALLOWED_CHAT_ID
 
 
 # ── send helper (used by reminders) ──────────────────────────────────────────
 
+# Reference to the PTB Application, set during post_init.
+# Used by _send() to deliver messages from non-handler contexts (reminders, jobs).
 _app_ref = None
 
 def _chunk_text(text: str) -> list[str]:
+    """
+    Split text into chunks of at most 4000 characters.
+
+    Telegram's message limit is 4096 characters; we use 4000 to leave
+    margin for any added formatting.
+    """
     if not text:
         return [""]
     return [text[i:i + 4000] for i in range(0, len(text), 4000)]
 
 
 async def _deliver_text(markdown_sender, plain_sender, text: str) -> None:
+    """
+    Deliver text using markdown formatting, falling back to plain text
+    if markdown parsing fails.
+
+    Telegram's MarkdownV1 parser is strict and rejects things like
+    unmatched asterisks or underscores, which LLMs produce frequently.
+    The plain-text fallback ensures the message always gets through.
+    """
     for chunk in _chunk_text(text):
         try:
             await markdown_sender(chunk)
@@ -62,6 +106,12 @@ async def _deliver_text(markdown_sender, plain_sender, text: str) -> None:
 
 
 async def _send(chat_id: str, text: str) -> None:
+    """
+    Send a message to a specific chat ID.
+
+    Used by the reminder system and background jobs to deliver messages
+    outside of the normal request-reply flow.
+    """
     if not _app_ref:
         return
     await _deliver_text(
@@ -81,6 +131,7 @@ async def _send(chat_id: str, text: str) -> None:
 # ── command handlers ──────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command -- show welcome message with feature overview."""
     if not _allowed(update):
         return
     await update.message.reply_text(
@@ -102,6 +153,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_slate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /slate command -- check Slate for pending work via the agent."""
     if not _allowed(update):
         return
     await update.message.chat.send_action(ChatAction.TYPING)
@@ -117,10 +169,12 @@ async def cmd_slate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_schoolwork(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /schoolwork command -- alias for /slate."""
     await cmd_slate(update, ctx)
 
 
 async def cmd_reminders(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /reminders command -- list pending reminders."""
     if not _allowed(update):
         return
     text = reminders.list_reminders()
@@ -128,6 +182,7 @@ async def cmd_reminders(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /calendar command -- list upcoming Apple Calendar events."""
     if not _allowed(update):
         return
     from bot.tools import list_apple_calendar_events
@@ -135,6 +190,7 @@ async def cmd_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /tasks command -- list open tasks."""
     if not _allowed(update):
         return
     from bot.tools import list_tasks
@@ -142,6 +198,7 @@ async def cmd_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_jobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /jobs command -- list background sub-agent jobs."""
     if not _allowed(update):
         return
     text = jobs.list_jobs_text(str(update.effective_chat.id), include_done=True, limit=10)
@@ -149,6 +206,7 @@ async def cmd_jobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /memory command -- list stored memories."""
     if not _allowed(update):
         return
     from bot.memory import list_all
@@ -156,6 +214,7 @@ async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /clear command -- clear conversation history for this chat."""
     if not _allowed(update):
         return
     agent.clear_history(str(update.effective_chat.id))
@@ -163,6 +222,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command -- show available commands and usage examples."""
     if not _allowed(update):
         return
     await update.message.reply_text(
@@ -195,6 +255,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _model_keyboard() -> InlineKeyboardMarkup:
+    """
+    Build an inline keyboard for the /models command.
+
+    Each model is a button. The currently selected model gets a checkmark prefix.
+    """
     current = agent.get_preferred_model()
     rows = []
     for item in agent.get_model_options():
@@ -204,6 +269,7 @@ def _model_keyboard() -> InlineKeyboardMarkup:
 
 
 def _model_menu_text() -> str:
+    """Build the text content for the model selection menu."""
     lines = [
         "*Model Selection*",
         f"Provider: *{agent.get_provider_label()}*",
@@ -224,6 +290,7 @@ def _model_menu_text() -> str:
 
 
 async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /models command -- show model selection menu with inline keyboard."""
     if not _allowed(update):
         return
     await update.message.reply_text(
@@ -234,6 +301,12 @@ async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_model_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle inline keyboard callback when a model is selected.
+
+    Updates the preferred model and refreshes the menu to show the
+    new selection.
+    """
     query = update.callback_query
     if not query:
         return
@@ -252,6 +325,7 @@ async def on_model_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer("Could not change model.", show_alert=True)
         return
     await query.answer("Primary model updated.")
+    # Refresh the menu in-place to show the updated selection
     await query.edit_message_text(
         _model_menu_text(),
         reply_markup=_model_keyboard(),
@@ -273,6 +347,17 @@ async def _safe_send(update: Update, text: str) -> None:
 # ── message handler ───────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Main message handler for all non-command messages.
+
+    Processing flow:
+      1. Build agent input from the message (text, voice, image)
+      2. If the user is asking about job status and there are active jobs,
+         short-circuit to the job status response
+      3. If the message looks like a browser/terminal task, route to a
+         background sub-agent so the main chat stays responsive
+      4. Otherwise, run the full LLM agent loop inline
+    """
     if not _allowed(update) or not update.message:
         return
 
@@ -282,10 +367,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("I can handle text, voice notes, and images right now.")
         return
 
+    # Short-circuit: status queries when background jobs are active
     if jobs.is_status_query(user_text) and jobs.has_active_jobs(chat_id):
         await _safe_send(update, jobs.job_status_text(chat_id))
         return
 
+    # Route browser/terminal tasks to background sub-agent
     if jobs.should_background(user_text) and not jobs.is_status_query(user_text):
         async def _run_agent(worker_chat_id: str, status_cb) -> str:
             return await agent.chat(worker_chat_id, user_text, status_cb=status_cb, background_mode=True)
@@ -303,7 +390,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             await _safe_send(update, f"⚠️ Couldn't start the background task: {e}")
         return
 
-    # Show typing indicator
+    # Normal flow: show typing indicator and run the agent inline
     await update.message.chat.send_action(ChatAction.TYPING)
 
     async def _status(text: str) -> None:
@@ -321,6 +408,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 # ── proactive Slate checker ───────────────────────────────────────────────────
 
 async def _periodic_slate_check() -> None:
+    """
+    Scheduled task that checks Slate for new assignments/changes.
+
+    Runs on an interval (CHECK_INTERVAL minutes) and notifies the user
+    about new items without being asked.
+    """
     log.info("Running scheduled Slate check...")
     try:
         await run_check(notify_new=True)
@@ -331,11 +424,19 @@ async def _periodic_slate_check() -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 async def _post_init(app: Application) -> None:
-    """Called by PTB after the event loop is running — safe for async setup."""
+    """
+    Called by PTB after the event loop is running -- safe for async setup.
+
+    Initialises:
+      1. The reminder scheduler with SQLite persistence
+      2. The periodic Slate checker on the configured interval
+      3. Clears legacy Slate reminder jobs from previous runs
+      4. Registers bot menu commands visible in the Telegram UI
+    """
     global _app_ref
     _app_ref = app
 
-    # Start scheduler
+    # Start the reminder scheduler
     scheduler = reminders.init_scheduler(_send)
     scheduler.add_job(
         _periodic_slate_check,
@@ -346,12 +447,13 @@ async def _post_init(app: Application) -> None:
         misfire_grace_time=120,
     )
     scheduler.start()
+    # Clear legacy Slate reminders from previous runs before re-syncing
     removed = reminders.clear_slate_reminders()
     if removed:
         log.info(f"Cleared {removed} legacy Slate reminder jobs")
     log.info(f"Scheduler started — Slate check every {CHECK_INTERVAL} min")
 
-    # Register bot menu commands
+    # Register bot menu commands (visible in Telegram's command menu)
     await app.bot.set_my_commands([
         BotCommand("schoolwork", "Show due school work"),
         BotCommand("slate", "Check assignments & quizzes"),
@@ -368,6 +470,13 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
+    """
+    Entry point: build the PTB application, register all handlers, and
+    start polling for updates.
+
+    drop_pending_updates=True skips any messages that arrived while the
+    bot was offline, preventing a flood of stale messages on restart.
+    """
     if not TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set in .env")
         sys.exit(1)
@@ -379,6 +488,7 @@ def main() -> None:
         .build()
     )
 
+    # Register command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("schoolwork", cmd_schoolwork))
     app.add_handler(CommandHandler("slate", cmd_slate))
@@ -390,7 +500,9 @@ def main() -> None:
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("help", cmd_help))
+    # Inline keyboard callback for model selection
     app.add_handler(CallbackQueryHandler(on_model_selected, pattern=r"^model:"))
+    # Catch-all message handler for text, voice, audio, photos, and documents
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,

@@ -1,6 +1,22 @@
 """
-Reminder system — APScheduler with SQLite persistence.
+Reminder system -- APScheduler with SQLite persistence.
 Survives restarts. Delivers via Telegram (+ optional Apple Reminders).
+
+Architecture notes:
+  - APScheduler is used with a SQLAlchemy/SQLite job store so that
+    scheduled reminders persist across bot restarts.
+  - The scheduler runs in UTC internally; all user-facing times are
+    converted to/from Toronto local time.
+  - Two types of reminders coexist:
+    1. User-created reminders (job IDs prefixed with "reminder_")
+    2. Slate-synced reminders (job IDs prefixed with "slate_") that
+       fire when assignments/quizzes are due. These are managed
+       automatically by sync_slate_reminders().
+  - The _fire callback is a module-level function (not a lambda or
+    nested function) because APScheduler needs to pickle job callbacks
+    for SQLite persistence.
+  - Slate reminder state is tracked in a JSON file so the system can
+    detect when due dates change and notify the user.
 """
 
 import os
@@ -18,8 +34,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# SQLite database file for persisting scheduled jobs across restarts
 REMINDERS_DB = Path(os.path.expanduser("~/.hermes/reminders.db"))
+# JSON file tracking Slate reminder state for change detection
 SLATE_REMINDER_STATE = Path(os.path.expanduser("~/.hermes/slate_reminders.json"))
+# Default Telegram chat ID for delivering reminders
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 LOCAL_TZ = ZoneInfo("America/Toronto")
 
@@ -28,6 +47,13 @@ _send_fn: Optional[Callable] = None          # set by telegram_bot at startup
 
 
 def init_scheduler(send_fn: Callable) -> AsyncIOScheduler:
+    """
+    Initialise the APScheduler with SQLite persistence.
+
+    Called once at bot startup from telegram_bot._post_init.
+    The send_fn callback is used by _fire() to deliver reminder messages
+    to Telegram.
+    """
     global _scheduler, _send_fn
     _send_fn = send_fn
     if _scheduler is not None:
@@ -41,11 +67,13 @@ def init_scheduler(send_fn: Callable) -> AsyncIOScheduler:
 
 
 def get_scheduler() -> Optional[AsyncIOScheduler]:
+    """Return the scheduler instance, or None if not yet initialised."""
     return _scheduler
 
 
 # ── time parsing ──────────────────────────────────────────────────────────────
 
+# Mapping of time unit names to timedelta objects for "in X units" parsing
 _UNITS = {
     "second": timedelta(seconds=1), "seconds": timedelta(seconds=1),
     "minute": timedelta(minutes=1), "minutes": timedelta(minutes=1),
@@ -56,25 +84,33 @@ _UNITS = {
 
 def parse_when(when: str) -> Optional[datetime]:
     """
-    Parse natural language:
-      "in 30 minutes", "in 2 hours", "in 3 days"
-      "tomorrow at 9am", "tomorrow at 14:00"
-      "2026-03-25 14:30"
-    Returns UTC datetime or None.
+    Parse natural language time expressions into a UTC datetime.
+
+    Supported formats:
+      - "in 30 minutes", "in 2 hours", "in 3 days"
+      - "tomorrow at 9am", "tomorrow at 14:00", "tomorrow" (defaults to 9:00 AM)
+      - "today at 3pm"
+      - ISO formats: "2026-03-25 14:30", "2026-03-25T14:30", "2026-03-25"
+
+    All relative/local times are interpreted in Toronto timezone, then
+    converted to UTC for storage.
+
+    Returns None if the format is not recognised.
     """
     s = when.strip().lower()
     now_utc = datetime.now(tz=timezone.utc)
     now_local = now_utc.astimezone(LOCAL_TZ)
 
-    # "in X unit"
+    # "in X unit" — relative time from now
     m = re.match(r"in\s+(\d+)\s+(\w+)", s)
     if m:
+        # Normalise unit name: strip trailing 's' then add it back for lookup
         n, unit = int(m.group(1)), m.group(2).rstrip("s") + "s"
         delta = _UNITS.get(unit) or _UNITS.get(m.group(2))
         if delta:
             return now_utc + delta * n
 
-    # "tomorrow at HH:MM" or "tomorrow at H[am|pm]"
+    # "tomorrow at HH:MM" or just "tomorrow" (defaults to 9:00 AM Toronto)
     m = re.match(r"tomorrow(?:\s+at\s+(.+))?", s)
     if m:
         base = (now_local + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
@@ -84,7 +120,7 @@ def parse_when(when: str) -> Optional[datetime]:
                 base = base.replace(hour=t[0], minute=t[1])
         return base.astimezone(timezone.utc)
 
-    # "today at HH:MM"
+    # "today at HH:MM" — if the time has already passed today, schedule for tomorrow
     m = re.match(r"today\s+at\s+(.+)", s)
     if m:
         t = _parse_time_of_day(m.group(1).strip())
@@ -94,7 +130,7 @@ def parse_when(when: str) -> Optional[datetime]:
                 dt += timedelta(days=1)
             return dt.astimezone(timezone.utc)
 
-    # ISO datetime
+    # ISO datetime formats
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt).replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
@@ -105,15 +141,26 @@ def parse_when(when: str) -> Optional[datetime]:
 
 
 def _parse_time_of_day(s: str):
-    # "14:30", "9:00", "9am", "2:30pm"
+    """
+    Parse a time-of-day string into (hour, minute) tuple.
+
+    Supported formats:
+      - "14:30" (24-hour)
+      - "9:00" (24-hour)
+      - "9am", "2:30pm" (12-hour with am/pm)
+
+    Returns None if the format is not recognised.
+    """
+    # "14:30", "9:00", or "2:30pm"
     m = re.match(r"(\d{1,2}):(\d{2})\s*(am|pm)?", s)
     if m:
         h, mn = int(m.group(1)), int(m.group(2))
         if m.group(3) == "pm" and h < 12:
             h += 12
         elif m.group(3) == "am" and h == 12:
-            h = 0
+            h = 0  # 12am = midnight
         return (h, mn)
+    # "9am", "2pm" (no minutes)
     m = re.match(r"(\d{1,2})\s*(am|pm)", s)
     if m:
         h = int(m.group(1))
@@ -128,21 +175,41 @@ def _parse_time_of_day(s: str):
 # ── job callback (must be module-level for APScheduler pickling) ──────────────
 
 async def _fire(message: str, chat_id: str) -> None:
+    """
+    Callback executed by APScheduler when a reminder fires.
+
+    Must be a module-level function (not a closure) because APScheduler
+    serialises job callbacks to the SQLite store using pickle, and closures
+    are not picklable.
+    """
     if _send_fn:
         await _send_fn(chat_id, f"⏰ *Reminder:* {message}")
 
 
 def _slate_item_key(item) -> str:
+    """
+    Generate a stable key for a Slate deliverable item.
+
+    Uses course_id:kind:item_id to uniquely identify each item across
+    syncs, even if the name changes.
+    """
     kind = getattr(item, "kind", item.__class__.__name__.lower())
     return f"{item.course.id}:{kind}:{item.id}"
 
 
 def _slate_job_id(key: str) -> str:
+    """
+    Convert a Slate item key into an APScheduler job ID.
+
+    Sanitises the key to be APScheduler-safe (alphanumeric + underscores)
+    and caps the length at 180 characters.
+    """
     safe = "".join(ch if ch.isalnum() else "_" for ch in key)
     return f"slate_{safe}"[:180]
 
 
 def _load_slate_state() -> dict[str, dict]:
+    """Load the previous Slate reminder sync state from the JSON file."""
     if not SLATE_REMINDER_STATE.exists():
         return {}
     try:
@@ -152,6 +219,7 @@ def _load_slate_state() -> dict[str, dict]:
 
 
 def _save_slate_state(state: dict[str, dict]) -> None:
+    """Persist the current Slate reminder sync state to the JSON file."""
     SLATE_REMINDER_STATE.parent.mkdir(parents=True, exist_ok=True)
     SLATE_REMINDER_STATE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
@@ -159,6 +227,14 @@ def _save_slate_state(state: dict[str, dict]) -> None:
 # ── public API ────────────────────────────────────────────────────────────────
 
 def set_reminder(when: str, message: str, chat_id: str = None) -> str:
+    """
+    Schedule a one-time reminder.
+
+    The job ID includes a timestamp and hash to avoid collisions.
+    replace_existing=True means setting the same reminder twice updates it.
+    misfire_grace_time=300 means if the bot was down when the reminder
+    was supposed to fire, it will still fire within 5 minutes of restart.
+    """
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not _scheduler:
         return "Scheduler not started yet."
@@ -187,8 +263,15 @@ def set_reminder(when: str, message: str, chat_id: str = None) -> str:
 
 
 def list_reminders() -> str:
+    """
+    List all pending user-created reminders with their fire times.
+
+    Shows both the absolute time and a relative ETA (e.g. "in 2h 30m").
+    Sorted by next fire time (soonest first).
+    """
     if not _scheduler:
         return "Scheduler not running."
+    # Only show user-created reminders (not Slate-synced ones)
     jobs = [j for j in _scheduler.get_jobs() if j.id.startswith("reminder_")]
     if not jobs:
         return "No pending reminders."
@@ -197,6 +280,7 @@ def list_reminders() -> str:
     for i, job in enumerate(sorted(jobs, key=lambda j: j.next_run_time or datetime.max.replace(tzinfo=timezone.utc)), 1):
         when = job.next_run_time
         if when:
+            # Calculate relative time remaining
             diff = when - now
             h, rem = divmod(int(diff.total_seconds()), 3600)
             m = rem // 60
@@ -210,7 +294,11 @@ def list_reminders() -> str:
 
 
 def cancel_reminder(ref: str) -> str:
-    """Cancel by 1-based index number or partial name match."""
+    """
+    Cancel a reminder by 1-based index number or partial name match.
+
+    The index corresponds to the order shown by list_reminders().
+    """
     if not _scheduler:
         return "Scheduler not running."
     jobs = sorted(
@@ -219,7 +307,7 @@ def cancel_reminder(ref: str) -> str:
     )
     if not jobs:
         return "No pending reminders to cancel."
-    # by index
+    # Try matching by 1-based index number first
     try:
         idx = int(ref) - 1
         if 0 <= idx < len(jobs):
@@ -228,7 +316,7 @@ def cancel_reminder(ref: str) -> str:
             return f'✅ Cancelled reminder: "{name}"'
     except ValueError:
         pass
-    # by name
+    # Fall back to partial name match
     ref_l = ref.lower()
     for job in jobs:
         if ref_l in job.name.lower():
@@ -238,6 +326,12 @@ def cancel_reminder(ref: str) -> str:
 
 
 def clear_slate_reminders() -> int:
+    """
+    Remove all Slate-synced reminders (called at startup to clean up
+    legacy jobs from previous runs before re-syncing).
+
+    Returns the number of jobs removed.
+    """
     removed = 0
     if _scheduler:
         for job in list(_scheduler.get_jobs()):
@@ -255,6 +349,18 @@ def clear_slate_reminders() -> int:
 
 
 async def sync_slate_reminders(items: list, chat_id: str = None) -> None:
+    """
+    Synchronise Slate assignment due-date reminders with APScheduler.
+
+    This is called periodically after fetching Slate data. It:
+      1. Creates/updates a reminder for each pending item with a due date
+      2. Detects due-date changes and notifies the user
+      3. Removes reminders for items that were submitted or deleted
+      4. Persists the current state for the next sync comparison
+
+    Items that are already submitted, have no due date, or are already
+    past due are skipped.
+    """
     chat_id = chat_id or TELEGRAM_CHAT_ID
     if not _scheduler or not chat_id:
         return
@@ -264,12 +370,14 @@ async def sync_slate_reminders(items: list, chat_id: str = None) -> None:
     current: dict[str, dict] = {}
 
     for item in items:
+        # Skip already-submitted items
         if getattr(item, "is_submitted", False):
             continue
         due_at = getattr(item, "due_date", None) or getattr(item, "end_date", None)
         if not due_at:
             continue
         due_at = due_at if due_at.tzinfo else due_at.replace(tzinfo=timezone.utc)
+        # Skip items that are already past due
         if due_at <= now:
             continue
 
@@ -282,6 +390,7 @@ async def sync_slate_reminders(items: list, chat_id: str = None) -> None:
             "due_at": due_at.isoformat(),
         }
 
+        # Schedule a reminder that fires at the due time
         job_id = _slate_job_id(key)
         message = f"{item.name} — {item.course.code} is due now."
         _scheduler.add_job(
@@ -291,9 +400,11 @@ async def sync_slate_reminders(items: list, chat_id: str = None) -> None:
             id=job_id,
             name=f"{item.name} ({item.course.code})",
             replace_existing=True,
+            # 15-minute grace period for misfired jobs (e.g. bot was restarting)
             misfire_grace_time=900,
         )
 
+        # Check if the due date or name changed since last sync
         old = previous.get(key)
         if not old:
             continue
@@ -313,6 +424,7 @@ async def sync_slate_reminders(items: list, chat_id: str = None) -> None:
                 f"ℹ️ *Slate update:* `{item.name}` ({item.course.code}) changed from {old_label} to {new_label}.",
             )
 
+    # Clean up reminders for items that were removed or submitted
     removed_keys = set(previous) - set(current)
     for key in removed_keys:
         job = _scheduler.get_job(_slate_job_id(key))

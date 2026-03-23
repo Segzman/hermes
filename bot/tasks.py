@@ -2,6 +2,21 @@
 Persistent task system for Hermes.
 
 Tracks actionable items separately from point-in-time reminders.
+
+Architecture notes:
+  - Tasks are stored in a SQLite database (~/.hermes/tasks.db) for
+    durability across restarts.
+  - Unlike reminders (which fire at a specific time), tasks persist
+    until explicitly completed or deleted. They represent ongoing
+    to-do items.
+  - Tasks can be imported from Slate assignments via task_from_slate()
+    in the tools module, linking them back to the source via the
+    source/source_id fields.
+  - Resolution by reference (ref) supports both numeric IDs and
+    partial title matches, making it easy for the user to say
+    "complete task homework" without knowing the numeric ID.
+  - The database schema is auto-created on first connection using
+    CREATE TABLE IF NOT EXISTS.
 """
 
 from __future__ import annotations
@@ -25,14 +40,22 @@ _VALID_STATUSES = ("open", "done")
 
 
 def _db_path() -> Path:
+    """Return the SQLite database file path (configurable via TASKS_DB env var)."""
     return Path(os.path.expanduser(os.getenv("TASKS_DB", "~/.hermes/tasks.db")))
 
 
 def _connect() -> sqlite3.Connection:
+    """
+    Open a connection to the tasks database, creating it if needed.
+
+    Uses sqlite3.Row as the row factory so results can be accessed
+    by column name (dict-like access).
+    """
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    # Auto-create the tasks table on first use
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS tasks (
@@ -55,6 +78,12 @@ def _connect() -> sqlite3.Connection:
 
 @contextmanager
 def _db():
+    """
+    Context manager for database operations.
+
+    Automatically commits on success and rolls back on exception.
+    Always closes the connection when done.
+    """
     conn = _connect()
     try:
         yield conn
@@ -67,10 +96,12 @@ def _db():
 
 
 def _now_iso() -> str:
+    """Return the current UTC time as an ISO 8601 string."""
     return datetime.now(tz=timezone.utc).isoformat()
 
 
 def _parse_dt(val: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO datetime string, returning None on failure."""
     if not val:
         return None
     try:
@@ -80,6 +111,16 @@ def _parse_dt(val: Optional[str]) -> Optional[datetime]:
 
 
 def _fmt_due(due_at: Optional[datetime]) -> str:
+    """
+    Format a due date for display with relative context.
+
+    Returns strings like:
+      - "Overdue Mar 20 02:00 PM Toronto"
+      - "Due today 02:00 PM Toronto"
+      - "Due tomorrow 02:00 PM Toronto"
+      - "Due Mon Mar 25 02:00 PM Toronto"
+      - "No due date"
+    """
     if not due_at:
         return "No due date"
     due = due_at if due_at.tzinfo else due_at.replace(tzinfo=timezone.utc)
@@ -96,24 +137,27 @@ def _fmt_due(due_at: Optional[datetime]) -> str:
 
 
 def _priority_emoji(priority: str) -> str:
+    """Map a priority level to a coloured circle emoji."""
     return {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(priority, "⚪")
 
 
 @dataclass
 class Task:
+    """Represents a single task item from the database."""
     id: int
     title: str
     notes: str
     status: str
     priority: str
     due_at: Optional[datetime]
-    source: str
-    source_id: str
+    source: str       # e.g. "slate" for imported tasks
+    source_id: str    # e.g. the Slate assignment ID
     created_at: datetime
     updated_at: datetime
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
+        """Construct a Task from a database row."""
         return cls(
             id=row["id"],
             title=row["title"],
@@ -128,6 +172,7 @@ class Task:
         )
 
     def summary(self) -> str:
+        """Format the task as a multi-line summary for display."""
         source = f" [{self.source}:{self.source_id}]" if self.source and self.source_id else ""
         notes = f"\n   {self.notes}" if self.notes else ""
         status = "✅" if self.status == "done" else _priority_emoji(self.priority)
@@ -135,22 +180,32 @@ class Task:
 
 
 def _normalize_priority(priority: str) -> str:
+    """Normalise a priority string, defaulting to 'medium' if invalid."""
     value = (priority or "medium").strip().lower()
     return value if value in _VALID_PRIORITIES else "medium"
 
 
 def _normalize_status(status: str) -> str:
+    """Normalise a status string, defaulting to 'open' if invalid."""
     value = (status or "open").strip().lower()
     return value if value in _VALID_STATUSES else "open"
 
 
 def _resolve_task(conn: sqlite3.Connection, ref: str) -> Optional[Task]:
+    """
+    Find a task by numeric ID or partial title match.
+
+    For title matches, prefers open tasks over completed ones, and
+    returns the most recently updated match (LIMIT 1).
+    """
     ref = str(ref).strip()
     if not ref:
         return None
+    # Try numeric ID first
     if ref.isdigit():
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (int(ref),)).fetchone()
         return Task.from_row(row) if row else None
+    # Fall back to partial title match (case-insensitive)
     like = f"%{ref.lower()}%"
     row = conn.execute(
         "SELECT * FROM tasks WHERE lower(title) LIKE ? ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1",
@@ -167,6 +222,12 @@ def add_task(
     source: str = "",
     source_id: str = "",
 ) -> Task:
+    """
+    Create a new task and return the created Task object.
+
+    Naive datetimes are assumed to be UTC. The source/source_id fields
+    are used to link back to the original system (e.g. "slate" + assignment ID).
+    """
     now = _now_iso()
     due_iso = (due_at if due_at and due_at.tzinfo else due_at.replace(tzinfo=timezone.utc)).isoformat() if due_at else None
     with _db() as conn:
@@ -182,6 +243,10 @@ def add_task(
 
 
 def list_tasks(status: str = "open", limit: int = 20) -> list[Task]:
+    """
+    List tasks filtered by status, ordered by priority (high first),
+    then by due date (soonest first, nulls last), then by creation time.
+    """
     status = _normalize_status(status)
     with _db() as conn:
         rows = conn.execute(
@@ -201,6 +266,11 @@ def list_tasks(status: str = "open", limit: int = 20) -> list[Task]:
 
 
 def set_task_status(ref: str, status: str) -> Optional[Task]:
+    """
+    Change a task's status (e.g. open -> done).
+
+    Returns the updated Task, or None if no task matched the reference.
+    """
     status = _normalize_status(status)
     with _db() as conn:
         task = _resolve_task(conn, ref)
@@ -213,6 +283,11 @@ def set_task_status(ref: str, status: str) -> Optional[Task]:
 
 
 def delete_task(ref: str) -> Optional[Task]:
+    """
+    Permanently delete a task.
+
+    Returns the deleted Task for confirmation display, or None if no match.
+    """
     with _db() as conn:
         task = _resolve_task(conn, ref)
         if not task:
@@ -222,11 +297,13 @@ def delete_task(ref: str) -> Optional[Task]:
 
 
 def get_task(ref: str) -> Optional[Task]:
+    """Look up a single task by ID or partial title match."""
     with _db() as conn:
         return _resolve_task(conn, ref)
 
 
 def format_task_list(status: str = "open", limit: int = 20) -> str:
+    """Format a task list as a multi-line string for display."""
     tasks = list_tasks(status=status, limit=limit)
     label = "Open tasks" if status == "open" else "Completed tasks"
     if not tasks:
